@@ -223,11 +223,17 @@ module atm_time_integration
 
       real (kind=RKIND), dimension(:,:), pointer :: w
       real (kind=RKIND), dimension(:,:), pointer :: u, uReconstructZonal, uReconstructMeridional, uReconstructX, uReconstructY, uReconstructZ
+      real (kind=RKIND), dimension(:,:), pointer :: acc_u_tend_dyn_small, acc_u_tend_dyn_small_ReconstructZonal, &
+          acc_u_tend_dyn_small_ReconstructMeridional, &
+          acc_u_tend_dyn_small_ReconstructX, acc_u_tend_dyn_small_ReconstructY, acc_u_tend_dyn_small_ReconstructZ 
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars, scalars_1, scalars_2
 
       real (kind=RKIND), dimension(:,:), pointer :: rqvdynten
 
       real (kind=RKIND)  :: time_dyn_step
+      ! MW on ITM
+      real (kind=RKIND), dimension(:,:), pointer :: acc_qv_tend_dyn_large
+
       logical, parameter :: debug = .false.
 
 
@@ -420,7 +426,6 @@ module atm_time_integration
          block => block % next
       end do
       call mpas_timer_stop('atm_compute_moist_coefficients')
-
 #ifdef DO_PHYSICS
       call mpas_timer_start('physics_get_tend')
       block => domain % blocklist
@@ -430,6 +435,7 @@ module atm_time_integration
          call mpas_pool_get_subpool(block % structs, 'diag', diag)
          call mpas_pool_get_subpool(block % structs, 'tend', tend)
          call mpas_pool_get_subpool(block % structs, 'tend_physics', tend_physics)
+         call mpas_pool_get_subpool(block % structs, 'diag_physics', diag_physics) ! MW on ITM: GWDO
          rk_step = 1
          dynamics_substep = 1
          call physics_get_tend( block, &
@@ -438,6 +444,7 @@ module atm_time_integration
                                  diag, &
                                  tend, &
                          tend_physics, &
+                         diag_physics, & ! MW on ITM: for GWDO tendencies
                       block % configs, &
                               rk_step, &
                      dynamics_substep, &
@@ -607,6 +614,7 @@ module atm_time_integration
 !$OMP PARALLEL DO
                do thread=1,nThreads
                   call atm_compute_dyn_tend( tend, tend_physics, state, diag, mesh, block % configs, nVertLevels, rk_step, dt, & 
+                                             rk_timestep(rk_step), & ! MW on ITM
                                              cellThreadStart(thread), cellThreadEnd(thread), &
                                              vertexThreadStart(thread), vertexThreadEnd(thread), &
                                              edgeThreadStart(thread), edgeThreadEnd(thread), &
@@ -1296,6 +1304,56 @@ module atm_time_integration
             !
          end if
 
+        ! MW on ITM: accumulate tendencies over each dynamic substep
+         call mpas_timer_start('atm_accumulate_tend')
+         block => domain % blocklist
+         do while (associated(block))
+             call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+             call mpas_pool_get_subpool(block % structs, 'state', state)
+             call mpas_pool_get_subpool(block % structs, 'diag', diag)
+             call mpas_pool_get_subpool(block % structs, 'tend', tend)
+
+             call mpas_pool_get_dimension(mesh, 'nCells', nCells)
+             call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+
+             call mpas_pool_get_dimension(block % dimensions, 'nThreads', nThreads)
+
+             call mpas_pool_get_dimension(block % dimensions, 'cellThreadStart', cellThreadStart)
+             call mpas_pool_get_dimension(block % dimensions, 'cellThreadEnd', cellThreadEnd)
+             call mpas_pool_get_dimension(block % dimensions, 'cellSolveThreadStart', cellSolveThreadStart)
+             call mpas_pool_get_dimension(block % dimensions, 'cellSolveThreadEnd', cellSolveThreadEnd)
+
+             call mpas_pool_get_dimension(block % dimensions, 'vertexThreadStart', vertexThreadStart)
+             call mpas_pool_get_dimension(block % dimensions, 'vertexThreadEnd', vertexThreadEnd)
+             call mpas_pool_get_dimension(block % dimensions, 'vertexSolveThreadStart', vertexSolveThreadStart)
+             call mpas_pool_get_dimension(block % dimensions, 'vertexSolveThreadEnd', vertexSolveThreadEnd)
+
+             call mpas_pool_get_dimension(block % dimensions, 'edgeThreadStart', edgeThreadStart)
+             call mpas_pool_get_dimension(block % dimensions, 'edgeThreadEnd', edgeThreadEnd)
+             call mpas_pool_get_dimension(block % dimensions, 'edgeSolveThreadStart', edgeSolveThreadStart)
+             call mpas_pool_get_dimension(block % dimensions, 'edgeSolveThreadEnd', edgeSolveThreadEnd)
+
+!$OMP PARALLEL DO
+             do thread=1,nThreads
+                call atm_accumulate_tend( state, diag, mesh, block % configs, nCells, nVertLevels, &
+                                             cellThreadStart(thread), cellThreadEnd(thread), &
+                                             vertexThreadStart(thread), vertexThreadEnd(thread), &
+                                             edgeThreadStart(thread), edgeThreadEnd(thread), &
+                                             cellSolveThreadStart(thread), cellSolveThreadEnd(thread), &
+                                             vertexSolveThreadStart(thread), vertexSolveThreadEnd(thread), &
+                                             edgeSolveThreadStart(thread), edgeSolveThreadEnd(thread), &
+                                             dt_dynamics, dynamics_substep, dynamics_split ) 
+             end do
+!$OMP END PARALLEL DO
+
+             block => block % next
+         end do
+         call mpas_timer_stop('atm_accumulate_tend')
+
+
+
+
+
          !  dynamics-transport split, WCS 18 November 2014
          !  (1) time level 1 needs to be set to time level 2
          !  (2) need to accumulate ruAvg and wwAvg over the dynamics substeps, prepare for use in transport
@@ -1341,6 +1399,52 @@ module atm_time_integration
          call mpas_timer_stop('atm_rk_dynamics_substep_finish')
 
       end do DYNAMICS_SUBSTEPS
+
+     ! MW on ITM: reconstruct zonal and meridional components of the horizontal momentum tendencies 
+      call mpas_timer_start('atm_reconstruct_tend')
+      block => domain % blocklist
+      do while (associated(block))
+             call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+             call mpas_pool_get_subpool(block % structs, 'state', state)
+             call mpas_pool_get_subpool(block % structs, 'diag', diag)
+             call mpas_pool_get_subpool(block % structs, 'tend', tend)
+
+             call mpas_pool_get_dimension(mesh, 'nCells', nCells)
+             call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+
+             call mpas_pool_get_dimension(block % dimensions, 'nThreads', nThreads)
+
+             call mpas_pool_get_dimension(block % dimensions, 'cellThreadStart', cellThreadStart)
+             call mpas_pool_get_dimension(block % dimensions, 'cellThreadEnd', cellThreadEnd)
+             call mpas_pool_get_dimension(block % dimensions, 'cellSolveThreadStart', cellSolveThreadStart)
+             call mpas_pool_get_dimension(block % dimensions, 'cellSolveThreadEnd', cellSolveThreadEnd)
+
+             call mpas_pool_get_dimension(block % dimensions, 'vertexThreadStart', vertexThreadStart)
+             call mpas_pool_get_dimension(block % dimensions, 'vertexThreadEnd', vertexThreadEnd)
+             call mpas_pool_get_dimension(block % dimensions, 'vertexSolveThreadStart', vertexSolveThreadStart)
+             call mpas_pool_get_dimension(block % dimensions, 'vertexSolveThreadEnd', vertexSolveThreadEnd)
+
+             call mpas_pool_get_dimension(block % dimensions, 'edgeThreadStart', edgeThreadStart)
+             call mpas_pool_get_dimension(block % dimensions, 'edgeThreadEnd', edgeThreadEnd)
+             call mpas_pool_get_dimension(block % dimensions, 'edgeSolveThreadStart', edgeSolveThreadStart)
+             call mpas_pool_get_dimension(block % dimensions, 'edgeSolveThreadEnd', edgeSolveThreadEnd)
+
+!$OMP PARALLEL DO
+             do thread=1,nThreads
+                call atm_reconstruct_tend( diag, mesh, block % configs, nCells, nVertLevels, &
+                                             cellThreadStart(thread), cellThreadEnd(thread), &
+                                             vertexThreadStart(thread), vertexThreadEnd(thread), &
+                                             edgeThreadStart(thread), edgeThreadEnd(thread), &
+                                             cellSolveThreadStart(thread), cellSolveThreadEnd(thread), &
+                                             vertexSolveThreadStart(thread), vertexSolveThreadEnd(thread), &
+                                             edgeSolveThreadStart(thread), edgeSolveThreadEnd(thread), &
+                                             dt_dynamics, dynamics_substep, dynamics_split ) 
+             end do
+!$OMP END PARALLEL DO
+
+             block => block % next
+      end do
+      call mpas_timer_stop('atm_reconstruct_tend')
 
 
       deallocate(qtot)  !  we are finished with these now
@@ -1641,6 +1745,10 @@ module atm_time_integration
                rqvdynten(:,:) = 0._RKIND
             end if
          end if
+         
+         ! MW on ITM
+         call mpas_pool_get_array(diag, 'acc_qv_tend_dyn_large', acc_qv_tend_dyn_large)
+         acc_qv_tend_dyn_large(:,:) = acc_qv_tend_dyn_large(:,:) + ( scalars_2(index_qv,:,:) - scalars_1(index_qv,:,:) ) / config_dt   
 
          !simply set to zero negative mixing ratios of different water species (for now):
          where ( scalars_2(:,:,:) < 0.0)  &
@@ -1844,6 +1952,7 @@ module atm_time_integration
       call mpas_pool_get_array(state, 'scalars', scalars_1, 1)
       call mpas_pool_get_array(state, 'scalars', scalars_2, 2)
 
+
       ru_save(:,edgeStart:edgeEnd) = ru(:,edgeStart:edgeEnd)
       rw_save(:,cellStart:cellEnd) = rw(:,cellStart:cellEnd)
       rtheta_p_save(:,cellStart:cellEnd) = rtheta_p(:,cellStart:cellEnd)
@@ -1855,6 +1964,7 @@ module atm_time_integration
       rho_zz_2(:,cellStart:cellEnd) = rho_zz_1(:,cellStart:cellEnd)
       rho_zz_old_split(:,cellStart:cellEnd) =  rho_zz_1(:,cellStart:cellEnd)
       scalars_2(:,:,cellStart:cellEnd) = scalars_1(:,:,cellStart:cellEnd)
+
 
    end subroutine atm_rk_integration_setup
 
@@ -2364,6 +2474,9 @@ module atm_time_integration
 
       integer, pointer :: nEdges, nCellsSolve
 
+! MW on ITM: tendency variables
+      real (kind=RKIND), dimension(:,:), pointer :: ru_tend_dyn_small, rth_tend_dyn_small
+
       call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
       call mpas_pool_get_array(mesh, 'edgesOnCell', edgesOnCell)
       call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
@@ -2431,11 +2544,17 @@ module atm_time_integration
       ! epssm is the offcentering coefficient for the vertically implicit integration.
       call mpas_pool_get_config(configs, 'config_epssm', epssm) 
 
+      ! MW on ITM: accumulate acoustic time-step dynamic tendencies
+      call mpas_pool_get_array(diag, 'ru_tend_dyn_small', ru_tend_dyn_small)
+      call mpas_pool_get_array(diag, 'rth_tend_dyn_small', rth_tend_dyn_small)
+
       call atm_advance_acoustic_step_work(nCells, nEdges, nCellsSolve, cellStart, cellEnd, vertexStart, vertexEnd, edgeStart, edgeEnd, &
                                    cellSolveStart, cellSolveEnd, vertexSolveStart, vertexSolveEnd, edgeSolveStart, edgeSolveEnd, &
                                    rho_zz, theta_m, ru_p, rw_p, rtheta_pp, rtheta_pp_old, zz, exner, cqu, ruAvg, wwAvg, &
                                    rho_pp, cofwt, coftz, zxu, a_tri, alpha_tri, gamma_tri, dss, tend_ru, tend_rho, tend_rt, &
-                                   tend_rw, zgrid, cofwr, cofwz, w, ru, ru_save, rw, rw_save, fzm, fzp, rdzw, dcEdge, invDcEdge, &
+                                   tend_rw, &
+                                   ru_tend_dyn_small, rth_tend_dyn_small, &  ! MW on ITM
+                                   zgrid, cofwr, cofwz, w, ru, ru_save, rw, rw_save, fzm, fzp, rdzw, dcEdge, invDcEdge, &
                                    invAreaCell, cofrz, dvEdge, nEdgesOnCell, cellsOnEdge, edgesOnCell, edgesOnCell_sign, &
                                    dts, small_step, epssm, cf1, cf2, cf3, &
                                    specZoneMaskEdge, specZoneMaskCell &
@@ -2448,7 +2567,9 @@ module atm_time_integration
                                    cellSolveStart, cellSolveEnd, vertexSolveStart, vertexSolveEnd, edgeSolveStart, edgeSolveEnd, &
                                    rho_zz, theta_m, ru_p, rw_p, rtheta_pp, rtheta_pp_old, zz, exner, cqu, ruAvg, wwAvg, &
                                    rho_pp, cofwt, coftz, zxu, a_tri, alpha_tri, gamma_tri, dss, tend_ru, tend_rho, tend_rt, &
-                                   tend_rw, zgrid, cofwr, cofwz, w, ru, ru_save, rw, rw_save, fzm, fzp, rdzw, dcEdge, invDcEdge, &
+                                   tend_rw, &
+                                   ru_tend_dyn_small, rth_tend_dyn_small, &  ! MW on ITM
+                                   zgrid, cofwr, cofwz, w, ru, ru_save, rw, rw_save, fzm, fzp, rdzw, dcEdge, invDcEdge, &
                                    invAreaCell, cofrz, dvEdge, nEdgesOnCell, cellsOnEdge, edgesOnCell, edgesOnCell_sign, &
                                    dts, small_step, epssm, cf1, cf2, cf3, &
                                    specZoneMaskEdge, specZoneMaskCell &
@@ -2532,6 +2653,10 @@ module atm_time_integration
       real (kind=RKIND) :: pgrad, flux, resm, rdts
 
 
+      ! MW on ITM test variables
+      real (kind=RKIND), dimension(nVertLevels,nEdges+1) :: ru_tend_dyn_small
+      real (kind=RKIND), dimension(nVertLevels,nCells+1) :: rth_tend_dyn_small
+
       rcv = rgas / (cp - rgas)
       c2 = cp * rcv
       resm = (1.0 - epssm) / (1.0 + epssm)
@@ -2563,6 +2688,8 @@ module atm_time_integration
                  pgrad = cqu(k,iEdge)*0.5*c2*(exner(k,cell1)+exner(k,cell2))*pgrad
                  pgrad = pgrad + 0.5*zxu(k,iEdge)*gravity*(rho_pp(k,cell1)+rho_pp(k,cell2))
                  ru_p(k,iEdge) = ru_p(k,iEdge) + dts*(tend_ru(k,iEdge) - (1.0_RKIND - specZoneMaskEdge(iEdge))*pgrad)
+                
+                 ru_tend_dyn_small(k,iEdge) = ru_tend_dyn_small(k,iEdge) -dts*pgrad ! MW on ITM
               end do
 
               ! accumulate ru_p for use later in scalar transport
@@ -2588,6 +2715,8 @@ module atm_time_integration
 !DIR$ IVDEP
               do k=1,nVertLevels
                  ru_p(k,iEdge) = dts*tend_ru(k,iEdge)
+                 
+                 ru_tend_dyn_small(k,iEdge) = 0. ! MW on ITM: zero-ing for first small timestep; only accumulate during RK_STEP == 3 
               end do
 !DIR$ IVDEP
               do k=1,nVertLevels
@@ -2609,6 +2738,7 @@ module atm_time_integration
             rtheta_pp_old(1:nVertLevels,iCell) = rtheta_pp(1:nVertLevels,iCell)
          end do
       end if
+      
 
 !$OMP BARRIER
 
@@ -2619,6 +2749,7 @@ module atm_time_integration
             rho_pp(1:nVertLevels,iCell) = 0.0            
             rtheta_pp(1:nVertLevels,iCell) = 0.0            
             rw_p(:,iCell) = 0.0
+            rth_tend_dyn_small(1:nVertLevels,iCell) = 0.0 ! MW on ITM
          end if
             
          if(specZoneMaskCell(iCell) == 0.0) then  ! not specified zone, compute...
@@ -2644,6 +2775,12 @@ module atm_time_integration
 
 !DIR$ IVDEP
          do k=1, nVertLevels
+            ! MW on ITM
+            rth_tend_dyn_small(k,iCell) = rth_tend_dyn_small(k,iCell) + ts(k)        &
+                               - resm*rdzw(k)*( coftz(k+1,iCell)*rw_p(k+1,iCell)     &
+                                               -coftz(k,iCell)*rw_p(k,iCell))
+            !
+
             rs(k) = rho_pp(k,iCell) + dts*tend_rho(k,iCell) + rs(k)                  &
                             - cofrz(k)*resm*(rw_p(k+1,iCell)-rw_p(k,iCell)) 
             ts(k) = rtheta_pp(k,iCell) + dts*tend_rt(k,iCell) + ts(k)                &
@@ -2702,9 +2839,19 @@ module atm_time_integration
 
 !DIR$ IVDEP
          do k=1,nVertLevels
+            ! MW on ITM 
+            ! note: rth_tend_dyn_small possibly needs to be recalculated using full theta values
+            !       to account for round-off errors. This can be done after the last small time-step 
+            !       in atm_recover_large_step_variables. 
+            rth_tend_dyn_small(k,iCell) = rth_tend_dyn_small(k,iCell) &
+                     - rdzw(k)*(coftz(k+1,iCell)*rw_p(k+1,iCell)  &
+                               -coftz(k  ,iCell)*rw_p(k  ,iCell)) 
+            !
+
             rho_pp(k,iCell) = rs(k) - cofrz(k) *(rw_p(k+1,iCell)-rw_p(k  ,iCell))
             rtheta_pp(k,iCell) = ts(k) - rdzw(k)*(coftz(k+1,iCell)*rw_p(k+1,iCell)  &
                                -coftz(k  ,iCell)*rw_p(k  ,iCell))
+
          end do
 
          else ! specifed zone in regional_MPAS
@@ -2747,6 +2894,9 @@ module atm_time_integration
 
       real (kind=RKIND) :: divCell1, divCell2, rdts, coef_divdamp
       integer :: cell1, cell2, iEdge, k
+      
+!     MW on ITM
+      real (kind=RKIND), dimension(:,:), pointer :: ru_tend_smdiv 
 
       call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
       call mpas_pool_get_array(mesh, 'specZoneMaskEdge', specZoneMaskEdge)
@@ -2761,6 +2911,9 @@ module atm_time_integration
 
       call mpas_pool_get_config(configs, 'config_smdiv', smdiv) 
       call mpas_pool_get_config(configs, 'config_len_disp', config_len_disp)
+
+!     MW on ITM
+      call mpas_pool_get_array(diag, 'ru_tend_smdiv', ru_tend_smdiv)
 
       rdts = 1.0_RKIND / dts
       coef_divdamp = 2.0_RKIND * smdiv * config_len_disp * rdts
@@ -2787,7 +2940,8 @@ module atm_time_integration
                divCell2 = -(rtheta_pp(k,cell2)-rtheta_pp_old(k,cell2))
                ru_p(k,iEdge) = ru_p(k,iEdge) + coef_divdamp*(divCell2-divCell1)*(1.0_RKIND - specZoneMaskEdge(iEdge)) &
                                                       /(theta_m(k,cell1)+theta_m(k,cell2))
-
+               ru_tend_smdiv(k,iEdge) = ru_tend_smdiv(k,iEdge) + coef_divdamp*(divCell2-divCell1) &  ! MW on ITM
+                                                      /(theta_m(k,cell1)+theta_m(k,cell2))
             end do
          end if ! edges for block-owned cells
       end do ! end loop over edges
@@ -2833,6 +2987,9 @@ module atm_time_integration
       integer, pointer :: nVertLevels, nCells, nCellsSolve, nEdges, nEdgesSolve
       real (kind=RKIND) :: invNs, rcv, p0, flux
       real (kind=RKIND), pointer :: cf1, cf2, cf3
+      
+      ! MW on ITM
+      real (kind=RKIND), dimension(:,:), pointer :: u_tend_dcpl, th_tend_dcpl, rho_zz_1
 
       integer, dimension(:), pointer :: bdyMaskCell  ! MPAS_regional addition
 
@@ -2892,9 +3049,14 @@ module atm_time_integration
       call mpas_pool_get_array(mesh, 'cf2', cf2)
       call mpas_pool_get_array(mesh, 'cf3', cf3)
 
+      call mpas_pool_get_array(diag, 'u_tend_dcpl', u_tend_dcpl)
+      call mpas_pool_get_array(diag, 'th_tend_dcpl', th_tend_dcpl)
+      call mpas_pool_get_array(state, 'rho_zz', rho_zz_1, 1)
 
       call atm_recover_large_step_variables_work(nCells, nEdges, nCellsSolve, nEdgesSolve, dt, ns, rk_step, &
-                             wwAvg, rw_save, w, rw, rw_p, rtheta_p, rtheta_pp, rtheta_p_save, rt_diabatic_tend, rho_p, &
+                             wwAvg, rw_save, w, rw, rw_p, rtheta_p, rtheta_pp, rtheta_p_save, rt_diabatic_tend, & 
+                             u_tend_dcpl, th_tend_dcpl, rho_zz_1, & ! MW on ITM
+                             rho_p, &
                              rho_p_save, rho_pp, rho_zz, rho_base, ruAvg, ru_save, ru_p, u, ru, exner, exner_base, &
                              rtheta_base, pressure_p, zz, theta_m, pressure_b, scalars, fzm, fzp, &
                              zb, zb3, zb_cell, zb3_cell, edgesOnCell_sign, cellsOnEdge, edgesOnCell, nEdgesOnCell, &
@@ -2907,7 +3069,9 @@ module atm_time_integration
 
 
    subroutine atm_recover_large_step_variables_work(nCells, nEdges, nCellsSolve, nEdgesSolve, dt, ns, rk_step, &
-                             wwAvg, rw_save, w, rw, rw_p, rtheta_p, rtheta_pp, rtheta_p_save, rt_diabatic_tend, rho_p, &
+                             wwAvg, rw_save, w, rw, rw_p, rtheta_p, rtheta_pp, rtheta_p_save, rt_diabatic_tend, &
+                             u_tend_dcpl, th_tend_dcpl, rho_zz_1, & ! MW on ITM
+                             rho_p, &
                              rho_p_save, rho_pp, rho_zz, rho_base, ruAvg, ru_save, ru_p, u, ru, exner, exner_base, &
                              rtheta_base, pressure_p, zz, theta_m, pressure_b, scalars, fzm, fzp, &
                              zb, zb3, zb_cell, zb3_cell, edgesOnCell_sign, cellsOnEdge, edgesOnCell, nEdgesOnCell, &
@@ -2980,14 +3144,23 @@ module atm_time_integration
       integer :: i, iCell, iEdge, k, cell1, cell2
       real (kind=RKIND) :: invNs, rcv, p0, flux
 
+      ! MW on ITM
+      real (kind=RKIND), dimension(nVertLevels,nCells+1) :: rho_zz_1 ! from beginning of dynamic time step
+      real (kind=RKIND), dimension(nVertLevels,nEdges+1) :: u_tend_dcpl
+      real (kind=RKIND), dimension(nVertLevels,nCells+1) :: th_tend_dcpl 
+      real (kind=RKIND) :: u_1_calc  ! local
+      real (kind=RKIND), dimension(nVertLevels,nCells+1) :: rho_zz_save  ! local; save the before-update rho_zz for diabatic theta tendency
+      ! MW:end
 
       rcv = rgas/(cp-rgas)
       p0 = 1.0e+05  ! this should come from somewhere else...
+
 
       ! Avoid FP errors caused by a potential division by zero below by 
       ! initializing the "garbage cell" of rho_zz to a non-zero value
       do k=1,nVertLevels
          rho_zz(k,nCells+1) = 1.0
+         rho_zz_save(k,nCells+1) = 1.0 ! MW test
       end do
 
       ! compute new density everywhere so we can compute u from ru.
@@ -3000,6 +3173,8 @@ module atm_time_integration
 !DIR$ IVDEP
          do k = 1, nVertLevels
             rho_p(k,iCell) = rho_p_save(k,iCell) + rho_pp(k,iCell)
+
+            rho_zz_save(k,iCell) = rho_zz(k,iCell) ! MW: saving time-level t rho_zz 
 
             rho_zz(k,iCell) = rho_p(k,iCell) + rho_base(k,iCell)
          end do
@@ -3021,13 +3196,28 @@ module atm_time_integration
          if (rk_step == 3) then
 !DIR$ IVDEP
             do k = 1, nVertLevels
+               ! MW note/bug fix:
+               !  rho_zz is not consistent with the rho_zz used in computing rt_diabatic_tend at time-level t 
+               !  rho_zz_save (see above) is the time-level t rho_zz value before it is updated. 
+
+               ! original mpas v5.2 code
+               !rtheta_p(k,iCell) = rtheta_p_save(k,iCell) + rtheta_pp(k,iCell) &
+               !                  - dt * rho_zz(k,iCell) * rt_diabatic_tend(k,iCell)
+               !
                rtheta_p(k,iCell) = rtheta_p_save(k,iCell) + rtheta_pp(k,iCell) &
-                                 - dt * rho_zz(k,iCell) * rt_diabatic_tend(k,iCell)
+                                 - dt * rho_zz_save(k,iCell) * rt_diabatic_tend(k,iCell)
+               ! MW:end
+  
                theta_m(k,iCell) = (rtheta_p(k,iCell) + rtheta_base(k,iCell))/rho_zz(k,iCell)
                exner(k,iCell) = (zz(k,iCell)*(rgas/p0)*(rtheta_p(k,iCell)+rtheta_base(k,iCell)))**rcv
                ! pressure_p is perturbation pressure
                pressure_p(k,iCell) = zz(k,iCell) * rgas * (exner(k,iCell)*rtheta_p(k,iCell)+rtheta_base(k,iCell)  &
                                                           * (exner(k,iCell)-exner_base(k,iCell)))
+
+               ! MW on ITM: compute decoupling term (change in rho_zz)
+               th_tend_dcpl(k,iCell)  = (rho_zz_1(k,iCell) - rho_zz(k,iCell))/rho_zz(k,iCell) * &
+                                            ((rtheta_p_save(k,iCell)+rtheta_base(k,iCell))/rho_zz_1(k,iCell)) 
+               
             end do
          else
 !DIR$ IVDEP
@@ -3055,7 +3245,16 @@ module atm_time_integration
             ruAvg(k,iEdge) = ru_save(k,iEdge) + (ruAvg(k,iEdge) * invNs)
             ru(k,iEdge) = ru_save(k,iEdge) + ru_p(k,iEdge)
             u(k,iEdge) = 2.*ru(k,iEdge)/(rho_zz(k,cell1)+rho_zz(k,cell2))
+
+            if (rk_step == 3) then 
+               ! MW on ITM: compute decoupling term
+               u_1_calc = 2.*ru_save(k,iEdge)/(rho_zz_1(k,cell1)+rho_zz_1(k,cell2))
+               u_tend_dcpl(k,iEdge) = ( 0.5*(rho_zz_1(k,cell1)+rho_zz_1(k,cell2)) - &
+                              0.5*(rho_zz(k,cell1)+rho_zz(k,cell2)))/(0.5*(rho_zz(k,cell1)+rho_zz(k,cell2)))*u_1_calc
+            end if
+ 
          end do
+
       end do
 
 !$OMP BARRIER
@@ -4215,6 +4414,7 @@ module atm_time_integration
 
 
    subroutine atm_compute_dyn_tend(tend, tend_physics, state, diag, mesh, configs, nVertLevels, rk_step, dt, &
+                                   dt_rk, &  ! MW on ITM
                                    cellStart, cellEnd, vertexStart, vertexEnd, edgeStart, edgeEnd, &
                                    cellSolveStart, cellSolveEnd, vertexSolveStart, vertexSolveEnd, edgeSolveStart, edgeSolveEnd)
    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 
@@ -4244,6 +4444,7 @@ module atm_time_integration
       integer, intent(in) :: nVertLevels              ! for allocating stack variables
       integer, intent(in) :: rk_step
       real (kind=RKIND), intent(in) :: dt
+      real (kind=RKIND), intent(in) :: dt_rk   ! MW on ITM 
       integer, intent(in) :: cellStart, cellEnd, vertexStart, vertexEnd, edgeStart, edgeEnd
       integer, intent(in) :: cellSolveStart, cellSolveEnd, vertexSolveStart, vertexSolveEnd, edgeSolveStart, edgeSolveEnd
 
@@ -4312,6 +4513,12 @@ module atm_time_integration
       integer, pointer :: config_number_rayleigh_damp_u_levels
 
       logical :: inactive_rthdynten
+
+      ! MW on ITM: dynamic and physics tendencies
+      real (kind=RKIND), dimension(:,:), pointer :: ru_tend_dyn_large, ru_tend_physics, & 
+                                                    ru_tend_diff, ru_tend_smdiv
+      real (kind=RKIND), dimension(:,:), pointer :: rth_tend_dyn_large, rth_tend_physics, & 
+                                                    rth_tend_diff
 
 
       call mpas_pool_get_config(mesh, 'sphere_radius', r_earth)
@@ -4439,6 +4646,17 @@ module atm_time_integration
       call mpas_pool_get_array(mesh, 'cf2', cf2)
       call mpas_pool_get_array(mesh, 'cf3', cf3)
 
+      ! MW on ITM
+      call mpas_pool_get_array(diag, 'ru_tend_dyn_large', ru_tend_dyn_large)
+      call mpas_pool_get_array(diag, 'ru_tend_diff', ru_tend_diff)
+      call mpas_pool_get_array(diag, 'ru_tend_physics',   ru_tend_physics)
+      call mpas_pool_get_array(diag, 'ru_tend_smdiv', ru_tend_smdiv)
+
+      call mpas_pool_get_array(diag, 'rth_tend_dyn_large', rth_tend_dyn_large)
+      call mpas_pool_get_array(diag, 'rth_tend_diff', rth_tend_diff)
+      call mpas_pool_get_array(diag, 'rth_tend_physics',   rth_tend_physics)
+
+
       !
       ! rthdynten is currently associated with packages, and if those packages
       ! are not active at run-time, we need to produce an rthdynten array for
@@ -4455,6 +4673,11 @@ module atm_time_integration
          nCellsSolve, nEdgesSolve, vertexDegree, maxEdges, maxEdges2, num_scalars, moist_start, moist_end, &
          fEdge, dvEdge, dcEdge, invDcEdge, invDvEdge, invAreaCell, invAreaTriangle, meshScalingDel2, meshScalingDel4, &
          weightsOnEdge, zgrid, rho_edge, rho_zz, ru, u, v, tend_u, &
+        ! MW on ITM
+         ru_tend_dyn_large, ru_tend_diff, ru_tend_physics, ru_tend_smdiv, &
+         rth_tend_dyn_large, rth_tend_diff, rth_tend_physics, & 
+         dt_rk, &
+        !
          divergence, vorticity, ke, pv_edge, theta_m, rw, tend_rho, &
          rt_diabatic_tend, tend_theta, tend_w, w, cqw, rb, rr, pp, pressure_b, zz, zxu, cqu, & 
          h_divergence, kdiff, edgesOnCell_sign, edgesOnVertex_sign, rw_save, ru_save, &
@@ -4482,6 +4705,11 @@ module atm_time_integration
       nCellsSolve, nEdgesSolve, vertexDegree, maxEdges_dummy, maxEdges2_dummy, num_scalars_dummy, moist_start, moist_end, &
       fEdge, dvEdge, dcEdge, invDcEdge, invDvEdge, invAreaCell, invAreaTriangle, meshScalingDel2, meshScalingDel4, &
       weightsOnEdge, zgrid, rho_edge, rho_zz, ru, u, v, tend_u, &
+     ! MW on ITM
+      ru_tend_dyn_large, ru_tend_diff, ru_tend_physics, ru_tend_smdiv, &
+      rth_tend_dyn_large, rth_tend_diff, rth_tend_physics, & 
+      dt_rk, &
+     !
       divergence, vorticity, ke, pv_edge, theta_m, rw, tend_rho, &
       rt_diabatic_tend, tend_theta, tend_w, w, cqw, rb, rr, pp, pressure_b, zz, zxu, cqu, & 
       h_divergence, kdiff, edgesOnCell_sign, edgesOnVertex_sign, rw_save, ru_save, &
@@ -4652,6 +4880,13 @@ module atm_time_integration
       real (kind=RKIND) :: flux3, flux4
       real (kind=RKIND) :: q_im2, q_im1, q_i, q_ip1, ua, coef3
 
+     ! MW on ITM
+      real (kind=RKIND), dimension(nVertLevels,nEdges+1) :: ru_tend_dyn_large, ru_tend_diff, ru_tend_physics, &
+                                                            ru_tend_smdiv 
+      real (kind=RKIND), dimension(nVertLevels,nCells+1) :: rth_tend_dyn_large, rth_tend_diff, rth_tend_physics
+      real (kind=RKIND), intent(in) :: dt_rk
+
+
       flux4(q_im2, q_im1, q_i, q_ip1, ua) =                     &
                 ua*( 7.*(q_i + q_im1) - (q_ip1 + q_im2) )/12.0
 
@@ -4666,6 +4901,8 @@ module atm_time_integration
 
        v_mom_eddy_visc2   = config_v_mom_eddy_visc2
        v_theta_eddy_visc2 = config_v_theta_eddy_visc2
+
+
 
       if (rk_step == 1) then
 
@@ -4849,6 +5086,7 @@ module atm_time_integration
       if (rk_step == 1) then
 
 !$OMP BARRIER
+         ru_tend_diff(1:nVertLevels,edgeStart:edgeEnd) = 0.0 ! MW on ITM 
 
          ! del^4 horizontal filter.  We compute this as del^2 ( del^2 (u) ).
          ! First, storage to hold the result from the first del^2 computation.
@@ -4878,6 +5116,8 @@ module atm_time_integration
                ! include 2nd-orer diffusion here 
                tend_u_euler(k,iEdge) = tend_u_euler(k,iEdge) &
                                        + rho_edge(k,iEdge)* kdiffu * u_diffusion * meshScalingDel2(iEdge)
+
+               ru_tend_diff(k,iEdge) = rho_edge(k,iEdge)* kdiffu * u_diffusion * meshScalingDel2(iEdge) ! MW on ITM
 
             end do
          end do
@@ -4937,6 +5177,8 @@ module atm_time_integration
                   u_diffusion =  rho_edge(k,iEdge) *  ( ( delsq_divergence(k,cell2)  - delsq_divergence(k,cell1) ) * r_dc  &
                                                        -( delsq_vorticity(k,vertex2) - delsq_vorticity(k,vertex1) ) * r_dv )
                   tend_u_euler(k,iEdge) = tend_u_euler(k,iEdge) - u_diffusion
+
+                  ru_tend_diff(k,iEdge) = ru_tend_diff(k,iEdge) - u_diffusion ! MW on ITM
                   
                end do
             end do
@@ -4969,6 +5211,10 @@ module atm_time_integration
                      tend_u_euler(k,iEdge) = tend_u_euler(k,iEdge) + rho_edge(k,iEdge) * v_mom_eddy_visc2*(  &
                                         (u(k+1,iEdge)-u(k  ,iEdge))/(zp-z0)                      &
                                        -(u(k  ,iEdge)-u(k-1,iEdge))/(z0-zm) )/(0.5*(zp-zm))
+
+                     ru_tend_diff(k,iEdge) = ru_tend_diff(k,iEdge) + rho_edge(k,iEdge) * v_mom_eddy_visc2*(  &
+                                        (u(k+1,iEdge)-u(k  ,iEdge))/(zp-z0)                      &
+                                       -(u(k  ,iEdge)-u(k-1,iEdge))/(z0-zm) )/(0.5*(zp-zm))   ! MW on ITM
                   end do
                end do
 
@@ -4998,6 +5244,10 @@ module atm_time_integration
                      tend_u_euler(k,iEdge) = tend_u_euler(k,iEdge) + rho_edge(k,iEdge) * v_mom_eddy_visc2*(  &
                                         (u_mix(k+1)-u_mix(k  ))/(zp-z0)                      &
                                        -(u_mix(k  )-u_mix(k-1))/(z0-zm) )/(0.5*(zp-zm))
+
+                     ru_tend_diff(k,iEdge) = ru_tend_diff(k,iEdge)  + rho_edge(k,iEdge) * v_mom_eddy_visc2*(  &
+                                        (u_mix(k+1)-u_mix(k  ))/(zp-z0)                      &
+                                       -(u_mix(k  )-u_mix(k-1))/(z0-zm) )/(0.5*(zp-zm)) ! MW on ITM
                   end do
                end do
 
@@ -5030,8 +5280,19 @@ module atm_time_integration
       do iEdge=edgeSolveStart,edgeSolveEnd
 !DIR$ IVDEP
          do k=1,nVertLevels
+
+            ! MW on ITM: large time-step dynamic tendency
+            if (rk_step == 3) then
+                  ru_tend_smdiv(k,iEdge) = 0.
+                  ru_tend_dyn_large(k,iEdge) = dt_rk*(tend_u(k,iEdge) + tend_u_euler(k,iEdge) - ru_tend_diff(k,iEdge)) 
+                  ru_tend_diff(k,iEdge)      = dt_rk*(ru_tend_diff(k,iEdge))
+                  ru_tend_physics(k,iEdge)   = dt_rk*tend_ru_physics(k,iEdge) ! will eventually use each scheme's tendency
+            end if
+
+
 !            tend_u(k,iEdge) = tend_u(k,iEdge) + tend_u_euler(k,iEdge)
             tend_u(k,iEdge) = tend_u(k,iEdge) + tend_u_euler(k,iEdge) + tend_ru_physics(k,iEdge)
+
          end do
       end do
 
@@ -5349,7 +5610,13 @@ module atm_time_integration
             tend_theta(k,iCell) = tend_theta(k,iCell)*invAreaCell(iCell) -rdzw(k)*(wdtz(k+1)-wdtz(k))
             tend_rtheta_adv(k,iCell) = tend_theta(k,iCell)   !  this is for the Tiedke scheme
             rthdynten(k,iCell) = tend_theta(k,iCell)/rho_zz(k,iCell)  !  this is for the Grell-Freitas scheme
-            tend_theta(k,iCell) = tend_theta(k,iCell) + rho_zz(k,iCell)*rt_diabatic_tend(k,iCell)
+
+            ! MW on ITM: note tendency saved BEFORE new rt_diabatic_tend is added
+            rth_tend_dyn_large(k,iCell) = dt_rk*tend_theta(k,iCell)
+
+            if (rk_step == 3) then
+               tend_theta(k,iCell) = tend_theta(k,iCell) + rho_zz(k,iCell)*rt_diabatic_tend(k,iCell)
+            end if
          end do
       end do
 
@@ -5410,6 +5677,12 @@ module atm_time_integration
          do k=1,nVertLevels
 !            tend_theta(k,iCell) = tend_theta(k,iCell) + tend_theta_euler(k,iCell)
             tend_theta(k,iCell) = tend_theta(k,iCell) + tend_theta_euler(k,iCell) + tend_rtheta_physics(k,iCell)
+           
+            ! MW on ITM
+            if (rk_step == 3) then
+                 rth_tend_diff(k,iCell)    = dt_rk*tend_theta_euler(k,iCell)
+                 rth_tend_physics(k,iCell) = dt_rk*tend_rtheta_physics(k,iCell) 
+            end if
          end do
       end do
 
@@ -6049,7 +6322,8 @@ module atm_time_integration
       call mpas_pool_get_array(state, 'rho_zz', rho_zz_2, 2)
 
       inv_dynamics_split = 1.0_RKIND / real(dynamics_split)
-      
+     
+
       if (dynamics_substep < dynamics_split) then
 
          ru_save(:,edgeStart:edgeEnd) = ru(:,edgeStart:edgeEnd)
@@ -6063,6 +6337,7 @@ module atm_time_integration
          rho_zz_1(:,cellStart:cellEnd) = rho_zz_2(:,cellStart:cellEnd)
 
       end if
+
 
       if (dynamics_substep == 1) then
          ruAvg_split(:,edgeStart:edgeEnd) = ruAvg(:,edgeStart:edgeEnd)
@@ -7016,5 +7291,473 @@ module atm_time_integration
       end if
 
    end subroutine summarize_timestep
+
+   subroutine atm_accumulate_tend( state, diag, mesh, configs, nCells, nVertLevels, & 
+                                   cellStart, cellEnd, vertexStart, vertexEnd, edgeStart, edgeEnd, &
+                                   cellSolveStart, cellSolveEnd, vertexSolveStart, vertexSolveEnd, edgeSolveStart, edgeSolveEnd, &
+                                   dt_dyn, dynamics_substep, dynamics_split)
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 
+   !  Accumulate tendencies for initial tendency method
+   !
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 
+      implicit none
+
+      type (mpas_pool_type), intent(inout) :: state
+      type (mpas_pool_type), intent(inout) :: diag
+      type (mpas_pool_type), intent(inout) :: mesh
+      type (mpas_pool_type), intent(in)    :: configs
+      integer, intent(in) :: nCells                  ! for allocating stack variables
+      integer, intent(in) :: nVertLevels             ! for allocating stack variables
+      integer, intent(in) :: cellStart, cellEnd, vertexStart, vertexEnd, edgeStart, edgeEnd
+      integer, intent(in) :: cellSolveStart, cellSolveEnd, vertexSolveStart, vertexSolveEnd, edgeSolveStart, edgeSolveEnd
+      real (kind=RKIND), intent(in) :: dt_dyn
+      integer, intent(in) :: dynamics_substep, dynamics_split
+
+      real (kind=RKIND), dimension(:,:), pointer :: ru_tend_dyn_small, ru_tend_dyn_large, ru_tend_diff, &
+                                                    ru_tend_physics, rublten_tend, rugwdo_tend, rucuten_tend, &
+                                                    ru_tend_smdiv, u_tend_dcpl
+      real (kind=RKIND), dimension(:,:), pointer :: rth_tend_dyn_small, rth_tend_dyn_large, rth_tend_diff, &
+                                                    rth_tend_physics, rthblten_tend, rthcuten_tend, rthratensw_tend, rthratenlw_tend, &
+                                                    th_tend_dcpl 
+      real (kind=RKIND), dimension(:,:), pointer :: rqv_tend_diff, qvblten_tend, qvcuten_tend 
+ 
+      real (kind=RKIND), dimension(:,:), pointer :: acc_u_tend_dyn_small, acc_u_tend_dyn_large, acc_u_tend_diff, &
+                                                    acc_u_tend_physics, acc_ublten, acc_ugwdoten, acc_ucuten, acc_u_tend_smdiv, &
+                                                    acc_u_tend_dcpl 
+      real (kind=RKIND), dimension(:,:), pointer :: acc_th_tend_dyn_small, acc_th_tend_dyn_large, acc_th_tend_diff, &
+                                                    acc_th_tend_physics, acc_thblten, acc_thcuten, acc_thratensw, acc_thratenlw, &
+                                                    acc_th_tend_dcpl
+      real (kind=RKIND), dimension(:,:), pointer :: acc_qv_tend_dyn_large, acc_qv_tend_diff, acc_qvblten, acc_qvcuten 
+
+      real (kind=RKIND), dimension(:,:), pointer :: u_1, u_2 
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz_1
+      real (kind=RKIND), dimension(:,:), pointer :: theta_m_1, theta_m_2 
+
+      integer, pointer :: nCellsSolve, nEdges
+      integer, dimension(:,:), pointer :: cellsOnEdge
+
+
+      call mpas_pool_get_dimension(mesh, 'nEdges', nEdges)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+
+      call mpas_pool_get_array(state, 'u', u_1, 1) ! for debugging 
+      call mpas_pool_get_array(state, 'u', u_2, 2) ! for debugging 
+      call mpas_pool_get_array(state, 'theta_m', theta_m_1, 1) ! for debugging 
+      call mpas_pool_get_array(state, 'theta_m', theta_m_2, 2) ! for debugging 
+      call mpas_pool_get_array(state, 'rho_zz', rho_zz_1, 1) ! for debugging 
+      call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2) ! for debugging 
+
+      call mpas_pool_get_array( diag, 'ru_tend_dyn_small', ru_tend_dyn_small) 
+      call mpas_pool_get_array( diag, 'ru_tend_dyn_large', ru_tend_dyn_large) 
+      call mpas_pool_get_array( diag, 'ru_tend_diff', ru_tend_diff) 
+      call mpas_pool_get_array( diag, 'ru_tend_physics', ru_tend_physics) 
+      call mpas_pool_get_array( diag, 'rublten_tend', rublten_tend)
+      call mpas_pool_get_array( diag, 'rugwdo_tend', rugwdo_tend)
+      call mpas_pool_get_array( diag, 'rucuten_tend', rucuten_tend)
+      call mpas_pool_get_array( diag, 'ru_tend_smdiv', ru_tend_smdiv) 
+      call mpas_pool_get_array( diag, 'u_tend_dcpl', u_tend_dcpl)
+
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_small', acc_u_tend_dyn_small) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_large', acc_u_tend_dyn_large) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_diff', acc_u_tend_diff)
+      call mpas_pool_get_array( diag, 'acc_u_tend_physics', acc_u_tend_physics)
+      call mpas_pool_get_array( diag, 'acc_ublten', acc_ublten )
+      call mpas_pool_get_array( diag, 'acc_ugwdoten', acc_ugwdoten )
+      call mpas_pool_get_array( diag, 'acc_ucuten', acc_ucuten )
+      call mpas_pool_get_array( diag, 'acc_u_tend_smdiv', acc_u_tend_smdiv)
+      call mpas_pool_get_array( diag, 'acc_u_tend_dcpl', acc_u_tend_dcpl)
+
+      call mpas_pool_get_array( diag, 'rth_tend_dyn_small', rth_tend_dyn_small) 
+      call mpas_pool_get_array( diag, 'rth_tend_dyn_large', rth_tend_dyn_large) 
+      call mpas_pool_get_array( diag, 'rth_tend_diff', rth_tend_diff) 
+      call mpas_pool_get_array( diag, 'rth_tend_physics', rth_tend_physics) 
+      call mpas_pool_get_array( diag, 'rthblten_tend', rthblten_tend)
+      call mpas_pool_get_array( diag, 'rthcuten_tend', rthcuten_tend)
+      call mpas_pool_get_array( diag, 'rthratensw_tend', rthratensw_tend)
+      call mpas_pool_get_array( diag, 'rthratenlw_tend', rthratenlw_tend)
+      call mpas_pool_get_array( diag, 'th_tend_dcpl', th_tend_dcpl)
+
+     !MW note: acc_th_tend_diabatic is accumulated in physics/mpas_atmphys_interface.F
+      call mpas_pool_get_array( diag, 'acc_th_tend_dyn_small', acc_th_tend_dyn_small) 
+      call mpas_pool_get_array( diag, 'acc_th_tend_dyn_large', acc_th_tend_dyn_large) 
+      call mpas_pool_get_array( diag, 'acc_th_tend_diff', acc_th_tend_diff)
+      call mpas_pool_get_array( diag, 'acc_th_tend_physics', acc_th_tend_physics)
+      call mpas_pool_get_array( diag, 'acc_thblten', acc_thblten)
+      call mpas_pool_get_array( diag, 'acc_thcuten', acc_thcuten)
+      call mpas_pool_get_array( diag, 'acc_thratensw', acc_thratensw)
+      call mpas_pool_get_array( diag, 'acc_thratenlw', acc_thratenlw)
+      call mpas_pool_get_array( diag, 'acc_th_tend_dcpl', acc_th_tend_dcpl)
+
+      call mpas_pool_get_array( diag, 'rqv_tend_diff', rqv_tend_diff)
+      call mpas_pool_get_array( diag, 'qvblten_tend', qvblten_tend)
+      call mpas_pool_get_array( diag, 'qvcuten_tend', qvcuten_tend)
+
+     !MW note: acc_qv_mp is accumulated in physics/mpas_atmphys_interface.F
+      call mpas_pool_get_array( diag, 'acc_qv_tend_dyn_large', acc_qv_tend_dyn_large)
+      call mpas_pool_get_array( diag, 'acc_qv_tend_diff', acc_qv_tend_diff)
+      call mpas_pool_get_array( diag, 'acc_qvblten', acc_qvblten)
+      call mpas_pool_get_array( diag, 'acc_qvcuten', acc_qvcuten)
+
+      call atm_accumulate_tend_work(nCells, nEdges, nCellsSolve, cellStart, cellEnd, vertexStart, vertexEnd, edgeStart, edgeEnd, &
+                                cellSolveStart, cellSolveEnd, vertexSolveStart, vertexSolveEnd, edgeSolveStart, edgeSolveEnd, & 
+                                ru_tend_dyn_small, ru_tend_dyn_large, ru_tend_diff, ru_tend_physics, &
+                                rublten_tend, rugwdo_tend, rucuten_tend, ru_tend_smdiv, u_tend_dcpl, &
+                                rth_tend_dyn_small, rth_tend_dyn_large, rth_tend_diff, rth_tend_physics, &
+                                rthblten_tend, rthcuten_tend, rthratensw_tend, rthratenlw_tend, th_tend_dcpl, &
+                                rqv_tend_diff, qvblten_tend, qvcuten_tend, & 
+                                acc_u_tend_dyn_small, acc_u_tend_dyn_large, acc_u_tend_diff, acc_u_tend_physics, &
+                                acc_ublten, acc_ugwdoten, acc_ucuten, acc_u_tend_smdiv, acc_u_tend_dcpl, & 
+                                acc_th_tend_dyn_small, acc_th_tend_dyn_large, acc_th_tend_diff, acc_th_tend_physics, &
+                                acc_thblten, acc_thcuten, acc_thratensw, acc_thratenlw, &
+                                acc_th_tend_dcpl, &
+                                acc_qv_tend_dyn_large, acc_qv_tend_diff, acc_qvblten, acc_qvcuten, & 
+                                cellsOnEdge, dt_dyn, dynamics_substep, dynamics_split, rho_zz_1, rho_zz, u_1, u_2, theta_m_1, theta_m_2)
+
+   end subroutine atm_accumulate_tend
+
+
+   subroutine atm_accumulate_tend_work(nCells, nEdges, nCellsSolve, cellStart, cellEnd, vertexStart, vertexEnd, edgeStart, edgeEnd, &
+                                cellSolveStart, cellSolveEnd, vertexSolveStart, vertexSolveEnd, edgeSolveStart, edgeSolveEnd, &   
+                                ru_tend_dyn_small, ru_tend_dyn_large, ru_tend_diff, ru_tend_physics, &
+                                rublten_tend, rugwdo_tend, rucuten_tend, ru_tend_smdiv, u_tend_dcpl, &
+                                rth_tend_dyn_small, rth_tend_dyn_large, rth_tend_diff, rth_tend_physics, &
+                                rthblten_tend, rthcuten_tend, rthratensw_tend, rthratenlw_tend, th_tend_dcpl, &
+                                rqv_tend_diff, qvblten_tend, qvcuten_tend, & 
+                                acc_u_tend_dyn_small, acc_u_tend_dyn_large, acc_u_tend_diff, acc_u_tend_physics, &
+                                acc_ublten, acc_ugwdoten, acc_ucuten, acc_u_tend_smdiv, acc_u_tend_dcpl, & 
+                                acc_th_tend_dyn_small, acc_th_tend_dyn_large, acc_th_tend_diff, acc_th_tend_physics, &
+                                acc_thblten, acc_thcuten, acc_thratensw, acc_thratenlw, &
+                                acc_th_tend_dcpl, &
+                                acc_qv_tend_dyn_large, acc_qv_tend_diff, acc_qvblten, acc_qvcuten, &
+                                cellsOnEdge, dt_dyn, dynamics_substep, dynamics_split, rho_zz_1, rho_zz, u_1, u_2, theta_m_1, theta_m_2)
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 
+   ! Accumulate tendencies for initial tendency method 
+   ! 
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 
+      use mpas_atm_dimensions
+
+      implicit none
+      !
+      ! Dummy arguments
+      !
+      integer, intent(in) :: nCells, nEdges, nCellsSolve
+      integer, intent(in) :: cellStart, cellEnd, vertexStart, vertexEnd, edgeStart, edgeEnd
+      integer, intent(in) :: cellSolveStart, cellSolveEnd, vertexSolveStart, vertexSolveEnd, edgeSolveStart, edgeSolveEnd
+      real (kind=RKIND), intent(in) :: dt_dyn
+      integer, intent(in) :: dynamics_substep, dynamics_split
+
+      ! Local variables
+      integer :: iEdge, k, cell1, cell2
+      integer :: iCell
+      
+      real (kind=RKIND), dimension(nVertLevels,nEdges+1) :: ru_tend_dyn_small, ru_tend_dyn_large, ru_tend_diff, &
+                                                            ru_tend_physics, rublten_tend, rugwdo_tend, rucuten_tend, &
+                                                            ru_tend_smdiv, u_tend_dcpl
+      real (kind=RKIND), dimension(nVertLevels,nEdges+1) :: acc_u_tend_dyn_small, acc_u_tend_dyn_large, acc_u_tend_diff, &
+                                                            acc_u_tend_physics, acc_ublten, acc_ugwdoten, acc_ucuten, acc_u_tend_smdiv, &
+                                                            acc_u_tend_dcpl 
+      real (kind=RKIND), dimension(nVertLevels,nCells+1) :: rth_tend_dyn_small, rth_tend_dyn_large, rth_tend_diff, &
+                                                            rth_tend_physics, rthblten_tend, rthcuten_tend, rthratensw_tend, rthratenlw_tend, &
+                                                            th_tend_dcpl
+      real (kind=RKIND), dimension(nVertLevels,nCells+1) :: acc_th_tend_dyn_small, acc_th_tend_dyn_large, acc_th_tend_diff, &
+                                                            acc_th_tend_physics, acc_thblten, acc_thcuten, acc_thratensw, acc_thratenlw, &
+                                                            acc_th_tend_dcpl
+      real (kind=RKIND), dimension(nVertLevels,nCells+1) :: rqv_tend_diff, qvblten_tend, qvcuten_tend 
+      real (kind=RKIND), dimension(nVertLevels,nCells+1) :: acc_qv_tend_dyn_large, acc_qv_tend_diff, &
+                                                            acc_qvblten, acc_qvcuten 
+
+       
+      real (kind=RKIND), dimension(nVertLevels,nEdges+1) :: u_1, u_2 
+      real (kind=RKIND), dimension(nVertLevels,nCells+1) :: rho_zz_1, rho_zz
+      real (kind=RKIND), dimension(nVertLevels,nCells+1) :: theta_m_1, theta_m_2 
+      
+      integer, dimension(2,nEdges+1) :: cellsOnEdge
+      real (kind=RKIND) :: drho_zz
+
+        do iEdge=edgeStart,edgeEnd ! MGD do we really just need edges touching owned cells?
+
+           cell1 = cellsOnEdge(1,iEdge)
+           cell2 = cellsOnEdge(2,iEdge)
+
+           ! update edges for block-owned cells
+           if (cell1 <= nCellsSolve .or. cell2 <= nCellsSolve ) then
+
+!DIR$ IVDEP
+              do k=1,nVertLevels
+
+                   drho_zz = 2./(rho_zz(k,cell1)+rho_zz(k,cell2))
+                  ! note: individual physic terms are already tendencies; other tendencies are integrated over dt_dyn
+                   acc_u_tend_dyn_small(k,iEdge) = acc_u_tend_dyn_small(k,iEdge) + ru_tend_dyn_small(k,iEdge)/(dt_dyn*dynamics_split)*drho_zz
+                   acc_u_tend_dyn_large(k,iEdge) = acc_u_tend_dyn_large(k,iEdge) + ru_tend_dyn_large(k,iEdge)/(dt_dyn*dynamics_split)*drho_zz
+                   acc_u_tend_diff(k,iEdge)      = acc_u_tend_diff(k,iEdge) + ru_tend_diff(k,iEdge)/(dt_dyn*dynamics_split)*drho_zz
+                   acc_u_tend_physics(k,iEdge)   = acc_u_tend_physics(k,iEdge) + ru_tend_physics(k,iEdge)/(dt_dyn*dynamics_split)*drho_zz
+                   acc_ublten(k,iEdge)           = acc_ublten(k,iEdge) + rublten_tend(k,iEdge)/dynamics_split*drho_zz
+                   acc_ugwdoten(k,iEdge)         = acc_ugwdoten(k,iEdge) + rugwdo_tend(k,iEdge)/dynamics_split*drho_zz
+                   acc_ucuten(k,iEdge)           = acc_ucuten(k,iEdge) + rucuten_tend(k,iEdge)/dynamics_split*drho_zz
+                   acc_u_tend_smdiv(k,iEdge)     = acc_u_tend_smdiv(k,iEdge) + ru_tend_smdiv(k,iEdge)/(dt_dyn*dynamics_split)*drho_zz
+                   acc_u_tend_dcpl(k,iEdge)      = acc_u_tend_dcpl(k,iEdge) + u_tend_dcpl(k,iEdge)/(dt_dyn*dynamics_split)
+              end do
+
+           end if ! end test for block-owned cells
+        end do ! end loop over edges
+
+
+        do iCell=cellSolveStart,cellSolveEnd  ! loop over all owned cells to solve
+!DIR$ IVDEP
+           do k=1,nVertLevels
+
+                   drho_zz = 1./rho_zz(k,iCell)
+
+                  ! theta_m
+                  ! MW note: acc_th_tend_diabatic is accumulated in physics/mpas_atmphys_interface.F
+                   acc_th_tend_dyn_small(k,iCell) = acc_th_tend_dyn_small(k,iCell) + rth_tend_dyn_small(k,iCell)/(dt_dyn*dynamics_split)*drho_zz
+                   acc_th_tend_dyn_large(k,iCell) = acc_th_tend_dyn_large(k,iCell) + rth_tend_dyn_large(k,iCell)/(dt_dyn*dynamics_split)*drho_zz
+                   acc_th_tend_diff(k,iCell)      = acc_th_tend_diff(k,iCell) + rth_tend_diff(k,iCell)/(dt_dyn*dynamics_split)*drho_zz
+                   acc_th_tend_physics(k,iCell)   = acc_th_tend_physics(k,iCell) + rth_tend_physics(k,iCell)/(dt_dyn*dynamics_split)*drho_zz
+                   acc_thblten(k,iCell)           = acc_thblten(k,iCell) + rthblten_tend(k,iCell)/dynamics_split*drho_zz
+                   acc_thcuten(k,iCell)           = acc_thcuten(k,iCell) + rthcuten_tend(k,iCell)/dynamics_split*drho_zz
+                   acc_thratensw(k,iCell)         = acc_thratensw(k,iCell) + rthratensw_tend(k,iCell)/dynamics_split*drho_zz
+                   acc_thratenlw(k,iCell)         = acc_thratenlw(k,iCell) + rthratenlw_tend(k,iCell)/dynamics_split*drho_zz
+                   acc_th_tend_dcpl(k,iCell)      = acc_th_tend_dcpl(k,iCell) + th_tend_dcpl(k,iCell)/(dt_dyn*dynamics_split)
+
+                  ! qv 
+                   acc_qvblten(k,iCell)           = acc_qvblten(k,iCell) + qvblten_tend(k,iCell)/dynamics_split
+                   acc_qvcuten(k,iCell)           = acc_qvcuten(k,iCell) + qvcuten_tend(k,iCell)/dynamics_split
+           end do
+        end do !  end of loop over cells
+
+   end subroutine atm_accumulate_tend_work
+
+   subroutine atm_reconstruct_tend( diag, mesh, configs, nCells, nVertLevels, & 
+                                   cellStart, cellEnd, vertexStart, vertexEnd, edgeStart, edgeEnd, &
+                                   cellSolveStart, cellSolveEnd, vertexSolveStart, vertexSolveEnd, edgeSolveStart, edgeSolveEnd, &
+                                   dt_dyn, dynamics_substep, dynamics_split)
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 
+   !  Reconstruct horizontal momentum tendencies to its zonal/meridional components
+   !  and returned at cell centers 
+   !
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 
+      implicit none
+
+      type (mpas_pool_type), intent(inout) :: diag
+      type (mpas_pool_type), intent(inout) :: mesh
+      type (mpas_pool_type), intent(in)    :: configs
+      integer, intent(in) :: nCells                  ! for allocating stack variables
+      integer, intent(in) :: nVertLevels             ! for allocating stack variables
+      integer, intent(in) :: cellStart, cellEnd, vertexStart, vertexEnd, edgeStart, edgeEnd
+      integer, intent(in) :: cellSolveStart, cellSolveEnd, vertexSolveStart, vertexSolveEnd, edgeSolveStart, edgeSolveEnd
+      real (kind=RKIND), intent(in) :: dt_dyn
+      integer, intent(in) :: dynamics_substep, dynamics_split
+
+      real (kind=RKIND), dimension(:,:), pointer :: ru_tend_dyn_small, ru_tend_dyn_large, ru_tend_diff, &
+                                                    ru_tend_physics, rublten_tend, rucuten_tend, &
+                                                    ru_tend_smdiv, u_tend_dcpl
+      real (kind=RKIND), dimension(:,:), pointer :: u_1, u_2 
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz
+      real (kind=RKIND), dimension(:,:), pointer :: acc_u_tend_dyn_small, &
+        acc_u_tend_dyn_small_ReconstructX, acc_u_tend_dyn_small_ReconstructY, acc_u_tend_dyn_small_ReconstructZ, & 
+        acc_u_tend_dyn_small_ReconstructZonal, acc_u_tend_dyn_small_ReconstructMeridional, &
+        acc_u_tend_dyn_large, &
+        acc_u_tend_dyn_large_ReconstructX, acc_u_tend_dyn_large_ReconstructY, acc_u_tend_dyn_large_ReconstructZ, &
+        acc_u_tend_dyn_large_ReconstructZonal, acc_u_tend_dyn_large_ReconstructMeridional, &
+        acc_u_tend_diff, &
+        acc_u_tend_diff_ReconstructX, acc_u_tend_diff_ReconstructY, acc_u_tend_diff_ReconstructZ, &
+        acc_u_tend_diff_ReconstructZonal, acc_u_tend_diff_ReconstructMeridional, &
+        acc_u_tend_physics, &
+        acc_u_tend_physics_ReconstructX, acc_u_tend_physics_ReconstructY, acc_u_tend_physics_ReconstructZ, &
+        acc_u_tend_physics_ReconstructZonal, acc_u_tend_physics_ReconstructMeridional, &
+        acc_ublten, &
+        acc_ublten_ReconstructX, acc_ublten_ReconstructY, acc_ublten_ReconstructZ, &
+        acc_ublten_ReconstructZonal, acc_ublten_ReconstructMeridional, &
+        acc_ugwdoten, &
+        acc_ugwdoten_ReconstructX, acc_ugwdoten_ReconstructY, acc_ugwdoten_ReconstructZ, &
+        acc_ugwdoten_ReconstructZonal, acc_ugwdoten_ReconstructMeridional, &
+        acc_ucuten, &
+        acc_ucuten_ReconstructX, acc_ucuten_ReconstructY, acc_ucuten_ReconstructZ, &
+        acc_ucuten_ReconstructZonal, acc_ucuten_ReconstructMeridional, &
+        acc_u_tend_smdiv, &
+        acc_u_tend_smdiv_ReconstructX, acc_u_tend_smdiv_ReconstructY, acc_u_tend_smdiv_ReconstructZ, &
+        acc_u_tend_smdiv_ReconstructZonal, acc_u_tend_smdiv_ReconstructMeridional, &
+        acc_u_tend_dcpl, &
+        acc_u_tend_dcpl_ReconstructX, acc_u_tend_dcpl_ReconstructY, acc_u_tend_dcpl_ReconstructZ, &
+        acc_u_tend_dcpl_ReconstructZonal, acc_u_tend_dcpl_ReconstructMeridional
+      integer, pointer :: nCellsSolve, nEdges
+      integer, dimension(:,:), pointer :: cellsOnEdge
+
+      type (field2DReal), pointer :: acc_u_tend_dyn_small_field
+      type (field2DReal), pointer :: acc_u_tend_dyn_large_field
+      type (field2DReal), pointer :: acc_u_tend_diff_field 
+      type (field2DReal), pointer :: acc_u_tend_physics_field 
+      type (field2DReal), pointer :: acc_ublten_field
+      type (field2DReal), pointer :: acc_ugwdoten_field
+      type (field2DReal), pointer :: acc_ucuten_field
+      type (field2DReal), pointer :: acc_u_tend_smdiv_field
+      type (field2DReal), pointer :: acc_u_tend_dcpl_field 
+
+      call mpas_pool_get_field(diag, 'acc_u_tend_dyn_small', acc_u_tend_dyn_small_field)
+      call mpas_dmpar_exch_halo_field(acc_u_tend_dyn_small_field)
+
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_small', acc_u_tend_dyn_small) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_small_ReconstructX', acc_u_tend_dyn_small_ReconstructX) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_small_ReconstructY', acc_u_tend_dyn_small_ReconstructY) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_small_ReconstructZ', acc_u_tend_dyn_small_ReconstructZ) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_small_ReconstructZonal', acc_u_tend_dyn_small_ReconstructZonal) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_small_ReconstructMeridional', acc_u_tend_dyn_small_ReconstructMeridional) 
+
+      call mpas_reconstruct(mesh, acc_u_tend_dyn_small,            &
+                            acc_u_tend_dyn_small_ReconstructX,          &
+                            acc_u_tend_dyn_small_ReconstructY,          &
+                            acc_u_tend_dyn_small_ReconstructZ,          &
+                            acc_u_tend_dyn_small_ReconstructZonal,      &
+                            acc_u_tend_dyn_small_ReconstructMeridional &
+                           )
+
+      call mpas_pool_get_field(diag, 'acc_u_tend_dyn_large', acc_u_tend_dyn_large_field)
+      call mpas_dmpar_exch_halo_field(acc_u_tend_dyn_large_field)
+
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_large', acc_u_tend_dyn_large) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_large_ReconstructX', acc_u_tend_dyn_large_ReconstructX) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_large_ReconstructY', acc_u_tend_dyn_large_ReconstructY) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_large_ReconstructZ', acc_u_tend_dyn_large_ReconstructZ) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_large_ReconstructZonal', acc_u_tend_dyn_large_ReconstructZonal) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dyn_large_ReconstructMeridional', acc_u_tend_dyn_large_ReconstructMeridional) 
+
+      call mpas_reconstruct(mesh, acc_u_tend_dyn_large,            &
+                            acc_u_tend_dyn_large_ReconstructX,          &
+                            acc_u_tend_dyn_large_ReconstructY,          &
+                            acc_u_tend_dyn_large_ReconstructZ,          &
+                            acc_u_tend_dyn_large_ReconstructZonal,      &
+                            acc_u_tend_dyn_large_ReconstructMeridional &
+                           )
+
+      call mpas_pool_get_field(diag, 'acc_u_tend_diff', acc_u_tend_diff_field)
+      call mpas_dmpar_exch_halo_field(acc_u_tend_diff_field)
+
+      call mpas_pool_get_array( diag, 'acc_u_tend_diff', acc_u_tend_diff) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_diff_ReconstructX', acc_u_tend_diff_ReconstructX) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_diff_ReconstructY', acc_u_tend_diff_ReconstructY) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_diff_ReconstructZ', acc_u_tend_diff_ReconstructZ) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_diff_ReconstructZonal', acc_u_tend_diff_ReconstructZonal) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_diff_ReconstructMeridional', acc_u_tend_diff_ReconstructMeridional) 
+
+      call mpas_reconstruct(mesh, acc_u_tend_diff,            &
+                            acc_u_tend_diff_ReconstructX,          &
+                            acc_u_tend_diff_ReconstructY,          &
+                            acc_u_tend_diff_ReconstructZ,          &
+                            acc_u_tend_diff_ReconstructZonal,      &
+                            acc_u_tend_diff_ReconstructMeridional &
+                           )
+
+      call mpas_pool_get_field(diag, 'acc_u_tend_physics', acc_u_tend_physics_field)
+      call mpas_dmpar_exch_halo_field(acc_u_tend_physics_field)
+
+      call mpas_pool_get_array( diag, 'acc_u_tend_physics', acc_u_tend_physics) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_physics_ReconstructX', acc_u_tend_physics_ReconstructX) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_physics_ReconstructY', acc_u_tend_physics_ReconstructY) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_physics_ReconstructZ', acc_u_tend_physics_ReconstructZ) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_physics_ReconstructZonal', acc_u_tend_physics_ReconstructZonal) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_physics_ReconstructMeridional', acc_u_tend_physics_ReconstructMeridional) 
+
+      call mpas_reconstruct(mesh, acc_u_tend_physics,            &
+                            acc_u_tend_physics_ReconstructX,          &
+                            acc_u_tend_physics_ReconstructY,          &
+                            acc_u_tend_physics_ReconstructZ,          &
+                            acc_u_tend_physics_ReconstructZonal,      &
+                            acc_u_tend_physics_ReconstructMeridional &
+                           )
+
+      call mpas_pool_get_field(diag, 'acc_ublten', acc_ublten_field)
+      call mpas_dmpar_exch_halo_field(acc_ublten_field)
+
+      call mpas_pool_get_array( diag, 'acc_ublten', acc_ublten) 
+      call mpas_pool_get_array( diag, 'acc_ublten_ReconstructX', acc_ublten_ReconstructX) 
+      call mpas_pool_get_array( diag, 'acc_ublten_ReconstructY', acc_ublten_ReconstructY) 
+      call mpas_pool_get_array( diag, 'acc_ublten_ReconstructZ', acc_ublten_ReconstructZ) 
+      call mpas_pool_get_array( diag, 'acc_ublten_ReconstructZonal', acc_ublten_ReconstructZonal) 
+      call mpas_pool_get_array( diag, 'acc_ublten_ReconstructMeridional', acc_ublten_ReconstructMeridional) 
+
+      call mpas_reconstruct(mesh, acc_ublten,            &
+                            acc_ublten_ReconstructX,          &
+                            acc_ublten_ReconstructY,          &
+                            acc_ublten_ReconstructZ,          &
+                            acc_ublten_ReconstructZonal,      &
+                            acc_ublten_ReconstructMeridional &
+                           )
+
+      call mpas_pool_get_field(diag, 'acc_ugwdoten', acc_ugwdoten_field)
+      call mpas_dmpar_exch_halo_field(acc_ugwdoten_field)
+
+      call mpas_pool_get_array( diag, 'acc_ugwdoten', acc_ugwdoten) 
+      call mpas_pool_get_array( diag, 'acc_ugwdoten_ReconstructX', acc_ugwdoten_ReconstructX) 
+      call mpas_pool_get_array( diag, 'acc_ugwdoten_ReconstructY', acc_ugwdoten_ReconstructY) 
+      call mpas_pool_get_array( diag, 'acc_ugwdoten_ReconstructZ', acc_ugwdoten_ReconstructZ) 
+      call mpas_pool_get_array( diag, 'acc_ugwdoten_ReconstructZonal', acc_ugwdoten_ReconstructZonal) 
+      call mpas_pool_get_array( diag, 'acc_ugwdoten_ReconstructMeridional', acc_ugwdoten_ReconstructMeridional) 
+
+      call mpas_reconstruct(mesh, acc_ugwdoten,            &
+                            acc_ugwdoten_ReconstructX,          &
+                            acc_ugwdoten_ReconstructY,          &
+                            acc_ugwdoten_ReconstructZ,          &
+                            acc_ugwdoten_ReconstructZonal,      &
+                            acc_ugwdoten_ReconstructMeridional &
+                           )
+
+      call mpas_pool_get_field(diag, 'acc_ucuten', acc_ucuten_field)
+      call mpas_dmpar_exch_halo_field(acc_ucuten_field)
+
+      call mpas_pool_get_array( diag, 'acc_ucuten', acc_ucuten) 
+      call mpas_pool_get_array( diag, 'acc_ucuten_ReconstructX', acc_ucuten_ReconstructX) 
+      call mpas_pool_get_array( diag, 'acc_ucuten_ReconstructY', acc_ucuten_ReconstructY) 
+      call mpas_pool_get_array( diag, 'acc_ucuten_ReconstructZ', acc_ucuten_ReconstructZ) 
+      call mpas_pool_get_array( diag, 'acc_ucuten_ReconstructZonal', acc_ucuten_ReconstructZonal) 
+      call mpas_pool_get_array( diag, 'acc_ucuten_ReconstructMeridional', acc_ucuten_ReconstructMeridional) 
+
+      call mpas_reconstruct(mesh, acc_ucuten,            &
+                            acc_ucuten_ReconstructX,          &
+                            acc_ucuten_ReconstructY,          &
+                            acc_ucuten_ReconstructZ,          &
+                            acc_ucuten_ReconstructZonal,      &
+                            acc_ucuten_ReconstructMeridional &
+                           )
+
+      call mpas_pool_get_field(diag, 'acc_u_tend_smdiv', acc_u_tend_smdiv_field)
+      call mpas_dmpar_exch_halo_field(acc_u_tend_smdiv_field)
+
+      call mpas_pool_get_array( diag, 'acc_u_tend_smdiv', acc_u_tend_smdiv) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_smdiv_ReconstructX', acc_u_tend_smdiv_ReconstructX) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_smdiv_ReconstructY', acc_u_tend_smdiv_ReconstructY) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_smdiv_ReconstructZ', acc_u_tend_smdiv_ReconstructZ) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_smdiv_ReconstructZonal', acc_u_tend_smdiv_ReconstructZonal) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_smdiv_ReconstructMeridional', acc_u_tend_smdiv_ReconstructMeridional) 
+
+      call mpas_reconstruct(mesh, acc_u_tend_smdiv,            &
+                            acc_u_tend_smdiv_ReconstructX,          &
+                            acc_u_tend_smdiv_ReconstructY,          &
+                            acc_u_tend_smdiv_ReconstructZ,          &
+                            acc_u_tend_smdiv_ReconstructZonal,      &
+                            acc_u_tend_smdiv_ReconstructMeridional &
+                           )
+
+      call mpas_pool_get_field(diag, 'acc_u_tend_dcpl', acc_u_tend_dcpl_field)
+      call mpas_dmpar_exch_halo_field(acc_u_tend_dcpl_field)
+
+      call mpas_pool_get_array( diag, 'acc_u_tend_dcpl', acc_u_tend_dcpl) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dcpl_ReconstructX', acc_u_tend_dcpl_ReconstructX) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dcpl_ReconstructY', acc_u_tend_dcpl_ReconstructY) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dcpl_ReconstructZ', acc_u_tend_dcpl_ReconstructZ) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dcpl_ReconstructZonal', acc_u_tend_dcpl_ReconstructZonal) 
+      call mpas_pool_get_array( diag, 'acc_u_tend_dcpl_ReconstructMeridional', acc_u_tend_dcpl_ReconstructMeridional) 
+
+      call mpas_reconstruct(mesh, acc_u_tend_dcpl,            &
+                            acc_u_tend_dcpl_ReconstructX,          &
+                            acc_u_tend_dcpl_ReconstructY,          &
+                            acc_u_tend_dcpl_ReconstructZ,          &
+                            acc_u_tend_dcpl_ReconstructZonal,      &
+                            acc_u_tend_dcpl_ReconstructMeridional &
+                           )
+
+   end subroutine atm_reconstruct_tend
 
 end module atm_time_integration

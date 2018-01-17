@@ -497,6 +497,9 @@
  real(kind=RKIND),dimension(:,:),pointer  :: re_cloud,re_ice,re_snow
  real(kind=RKIND),dimension(:,:,:),pointer:: scalars
 
+! MW on ITM 
+ real(kind=RKIND),dimension(:,:),pointer  :: qv_mp_tend
+
 !local variables:
  integer:: i,k,j
 
@@ -532,6 +535,11 @@
  call mpas_pool_get_dimension(state,'index_ni'  ,index_ni  )
  call mpas_pool_get_dimension(state,'index_nr'  ,index_nr  )
 
+
+ ! MW on ITM
+ call mpas_pool_get_array(diag,'qv_mp_tend', qv_mp_tend)
+ !
+
  call mpas_pool_get_array(state,'scalars',scalars,time_lev)
  qv   => scalars(index_qv,:,:)
  qc   => scalars(index_qc,:,:)
@@ -554,6 +562,9 @@
     z_p(i,k,j)    = zgrid(k,i)
     dz_p(i,k,j)   = zgrid(k+1,i) - zgrid(k,i)
     w_p(i,k,j)    = w(k,i)
+
+    ! MW on ITM
+    qv_mp_tend(k,i) = qv(k,i)   ! save qv before call to microphysics 
  enddo
  enddo
  enddo
@@ -644,6 +655,10 @@
  real(kind=RKIND),dimension(:,:),pointer  :: re_cloud,re_ice,re_snow
  real(kind=RKIND),dimension(:,:,:),pointer:: scalars
 
+! MW on ITM: accumulating theta diabatic tendency term
+ real(kind=RKIND),dimension(:,:),pointer  :: acc_th_tend_diabatic
+ real(kind=RKIND),dimension(:,:),pointer  :: qv_mp_tend, acc_qv_mp_tend 
+
 !local variables:
  integer:: icount
  integer:: i,k,j
@@ -684,6 +699,12 @@
  call mpas_pool_get_dimension(state,'index_ni'  ,index_ni  )
  call mpas_pool_get_dimension(state,'index_nr'  ,index_nr  )
 
+! MW on ITM
+ call mpas_pool_get_array(diag,'acc_th_tend_diabatic', acc_th_tend_diabatic)
+ call mpas_pool_get_array(diag,'qv_mp_tend', qv_mp_tend)
+ call mpas_pool_get_array(diag,'acc_qv_mp_tend', acc_qv_mp_tend)
+!
+
  call mpas_pool_get_array(state,'scalars',scalars,time_lev)
  qv   => scalars(index_qv,:,:)
  qc   => scalars(index_qc,:,:)
@@ -714,6 +735,11 @@
     pressure_p(k,i) = zz(k,i)*R_d*(exner(k,i)*rtheta_p(k,i) &
                     + (exner(k,i)-exner_b(k,i))*rtheta_b(k,i))
 
+
+    ! MW on ITM: flux version
+    acc_th_tend_diabatic(k,i) = acc_th_tend_diabatic(k,i) + rt_diabatic_tend(k,i)
+    acc_qv_mp_tend(k,i) = acc_qv_mp_tend(k,i) + ( qv(k,i) - qv_mp_tend(k,i))/dt_dyn 
+  
  enddo
  enddo
  enddo
