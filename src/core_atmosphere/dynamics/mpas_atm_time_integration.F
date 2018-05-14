@@ -3215,8 +3215,8 @@ module atm_time_integration
                                                           * (exner(k,iCell)-exner_base(k,iCell)))
 
                ! MW on ITM: compute decoupling term (change in rho_zz)
-               th_tend_dcpl(k,iCell)  = (rho_zz_1(k,iCell) - rho_zz(k,iCell))/rho_zz(k,iCell) * &
-                                            ((rtheta_p_save(k,iCell)+rtheta_base(k,iCell))/rho_zz_1(k,iCell)) 
+               th_tend_dcpl(k,iCell)  = (rho_zz_1(k,iCell) - rho_zz(k,iCell))/rho_zz_1(k,iCell) * &
+                                            theta_m(k,iCell) 
                
             end do
          else
@@ -3248,9 +3248,8 @@ module atm_time_integration
 
             if (rk_step == 3) then 
                ! MW on ITM: compute decoupling term
-               u_1_calc = 2.*ru_save(k,iEdge)/(rho_zz_1(k,cell1)+rho_zz_1(k,cell2))
                u_tend_dcpl(k,iEdge) = ( 0.5*(rho_zz_1(k,cell1)+rho_zz_1(k,cell2)) - &
-                              0.5*(rho_zz(k,cell1)+rho_zz(k,cell2)))/(0.5*(rho_zz(k,cell1)+rho_zz(k,cell2)))*u_1_calc
+                              0.5*(rho_zz(k,cell1)+rho_zz(k,cell2)))/(0.5*(rho_zz_1(k,cell1)+rho_zz_1(k,cell2)))*u(k,iEdge)
             end if
  
          end do
@@ -7487,7 +7486,8 @@ module atm_time_integration
 !DIR$ IVDEP
               do k=1,nVertLevels
 
-                   drho_zz = 2./(rho_zz(k,cell1)+rho_zz(k,cell2))
+                   drho_zz = 2./(rho_zz_1(k,cell1)+rho_zz_1(k,cell2))
+
                   ! note: individual physic terms are already tendencies; other tendencies are integrated over dt_dyn
                    acc_u_tend_dyn_small(k,iEdge) = acc_u_tend_dyn_small(k,iEdge) + ru_tend_dyn_small(k,iEdge)/(dt_dyn*dynamics_split)*drho_zz
                    acc_u_tend_dyn_large(k,iEdge) = acc_u_tend_dyn_large(k,iEdge) + ru_tend_dyn_large(k,iEdge)/(dt_dyn*dynamics_split)*drho_zz
@@ -7508,7 +7508,7 @@ module atm_time_integration
 !DIR$ IVDEP
            do k=1,nVertLevels
 
-                   drho_zz = 1./rho_zz(k,iCell)
+                   drho_zz = 1./rho_zz_1(k,iCell)
 
                   ! theta_m
                   ! MW note: acc_th_tend_diabatic is accumulated in physics/mpas_atmphys_interface.F
