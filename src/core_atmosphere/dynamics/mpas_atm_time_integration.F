@@ -229,6 +229,9 @@ module atm_time_integration
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars, scalars_1, scalars_2
 
       real (kind=RKIND), dimension(:,:), pointer :: rqvdynten
+      real (kind=RKIND), dimension(:,:), pointer :: rthdynten, theta_m, rho_zz
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars_tend
+      real (kind=RKIND) :: theta_local, fac_m 
 
       real (kind=RKIND)  :: time_dyn_step
       ! MW on ITM
@@ -1735,12 +1738,31 @@ module atm_time_integration
             config_convection_scheme == 'cu_ntiedtke') then
 
             call mpas_pool_get_array(tend_physics, 'rqvdynten', rqvdynten)
+            call mpas_pool_get_array(tend_physics, 'rthdynten', rthdynten)
+            call mpas_pool_get_array(state, 'theta_m', theta_m,2)
+            call mpas_pool_get_array(state, 'rho_zz', rho_zz,1)
+            call mpas_pool_get_array(tend, 'scalars_tend', scalars_tend)
+            call mpas_pool_get_dimension(state, 'nCellsSolve', nCellsSolve)
+            call mpas_pool_get_dimension(state, 'nVertLevels', nVertLevels)
 
             !NOTE: The calculation of the tendency due to horizontal and vertical advection for the water vapor mixing ratio
             !requires that the subroutine atm_advance_scalars_mono was called on the third Runge Kutta step, so that a halo
             !update for the scalars at time_levs(1) is applied. A halo update for the scalars at time_levs(2) is done above. 
             if (config_monotonic) then
-               rqvdynten(:,:) = ( scalars_2(index_qv,:,:) - scalars_1(index_qv,:,:) ) / config_dt
+               ! rqvdynten(:,:) = ( scalars_2(index_qv,:,:) - scalars_1(index_qv,:,:) ) / config_dt
+
+               do iCell = 1, nCellsSolve
+                 do k = 1, nVertLevels
+                   rqvdynten(k,iCell) = (   scalars_2(index_qv,k,iCell) - scalars_1(index_qv,k,iCell) ) / config_dt
+                 ! remove physics tendency that is in qv update
+                   rqvdynten(k,iCell) = rqvdynten(k,iCell) - scalars_tend(index_qv,k,iCell)/rho_zz(k,iCell)
+                 ! fix theta advection tendency - convert from theta_m to theta
+                   fac_m = 1./(1. + 1.61*scalars_2(index_qv,k,iCell))
+                   theta_local = theta_m(k,iCell)*fac_m
+                   rthdynten(k,iCell) = fac_m*(rthdynten(k,iCell)-theta_local*1.61*rqvdynten(k,iCell))
+                 end do
+               end do
+
             else
                rqvdynten(:,:) = 0._RKIND
             end if
